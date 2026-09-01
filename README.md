@@ -89,7 +89,7 @@ Product Growth
 
 Product Case Studies
 
-# Day 01: Project Management Fundamentals
+# Day 00: Project Management Fundamentals
 
 ## Objective
 
@@ -131,9 +131,3 @@ Project Management provides the structure required to plan, execute, monitor, an
 ## Learning Approach
 
 Project Management will be covered gradually, starting with fundamental concepts and progressing toward project planning, scheduling, risk management, stakeholder management, Agile, Scrum, project controls, delivery management, and advanced project management concepts.
-
-## Day 01 Completed
-
-**Focus:** Project Management Fundamentals
-
-**Next:** Continue with the next concepts in Project Management.
