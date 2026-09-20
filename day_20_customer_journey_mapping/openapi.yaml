@@ -1,0 +1,159 @@
+# File: openapi.yaml
+openapi: 3.0.3
+info:
+  title: Customer Journey Mapping API
+  version: 1.0.0
+  description: API for analyzing structured customer journey maps.
+
+servers:
+  - url: http://localhost:8000
+
+paths:
+  /health:
+    get:
+      summary: Check service health
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /api/journeys/analyze:
+    post:
+      summary: Analyze a customer journey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JourneyMap"
+      responses:
+        "200":
+          description: Journey analysis
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JourneyAnalysis"
+        "422":
+          description: Validation error
+
+components:
+  schemas:
+    Touchpoint:
+      type: object
+      required:
+        - channel
+        - description
+        - sentiment
+        - effort
+        - frequency
+      properties:
+        channel:
+          type: string
+          minLength: 1
+        description:
+          type: string
+          minLength: 1
+        sentiment:
+          type: integer
+          minimum: -5
+          maximum: 5
+        effort:
+          type: integer
+          minimum: 1
+          maximum: 5
+        frequency:
+          type: integer
+          minimum: 1
+          maximum: 5
+
+    JourneyStage:
+      type: object
+      required:
+        - name
+        - customer_goal
+        - customer_actions
+      properties:
+        name:
+          type: string
+          enum:
+            - awareness
+            - consideration
+            - purchase
+            - onboarding
+            - usage
+            - retention
+            - advocacy
+        customer_goal:
+          type: string
+        customer_actions:
+          type: array
+          items:
+            type: string
+        thoughts:
+          type: array
+          items:
+            type: string
+        emotions:
+          type: array
+          items:
+            type: string
+        pain_points:
+          type: array
+          items:
+            type: string
+        opportunities:
+          type: array
+          items:
+            type: string
+        touchpoints:
+          type: array
+          items:
+            $ref: "#/components/schemas/Touchpoint"
+
+    JourneyMap:
+      type: object
+      required:
+        - persona
+        - scenario
+        - stages
+      properties:
+        persona:
+          type: string
+        scenario:
+          type: string
+        stages:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/JourneyStage"
+
+    JourneyAnalysis:
+      type: object
+      properties:
+        average_sentiment:
+          type: number
+        average_effort:
+          type: number
+        total_touchpoints:
+          type: integer
+        pain_point_count:
+          type: integer
+        opportunity_count:
+          type: integer
+        strongest_stage:
+          type: string
+          nullable: true
+        weakest_stage:
+          type: string
+          nullable: true
+        channel_frequency:
+          type: object
+          additionalProperties:
+            type: integer
