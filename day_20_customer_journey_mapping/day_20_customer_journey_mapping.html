@@ -1,0 +1,75 @@
+<!-- File: frontend/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta
+    name="description"
+    content="Customer journey mapping educational application"
+  />
+  <title>Customer Journey Mapping Lab</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="hero">
+    <p class="eyebrow">CUSTOMER EXPERIENCE DESIGN</p>
+    <h1>Customer Journey Mapping Lab</h1>
+    <p>
+      Map the customer's experience from awareness through advocacy,
+      document emotions and pain points, and analyze experience quality.
+    </p>
+  </header>
+
+  <main>
+    <section class="profile">
+      <label>
+        Persona
+        <input id="persona" value="First-time SaaS buyer" />
+      </label>
+
+      <label>
+        Scenario
+        <input
+          id="scenario"
+          value="Evaluating a project-management platform"
+        />
+      </label>
+    </section>
+
+    <section>
+      <div class="section-heading">
+        <h2>Journey stages</h2>
+        <p>
+          A journey map connects customer goals, actions, thoughts,
+          emotions, touchpoints, pain points, and opportunities.
+        </p>
+      </div>
+
+      <div id="stage-container" class="stage-grid"></div>
+    </section>
+
+    <section class="analysis">
+      <div class="section-heading">
+        <h2>Journey analysis</h2>
+        <p>
+          The analysis provides descriptive metrics rather than a subjective
+          judgment about the customer experience.
+        </p>
+      </div>
+
+      <button id="analyze-button" type="button">Analyze journey</button>
+
+      <div id="analysis-output" class="analysis-grid">
+        <p>Enter journey information and select Analyze journey.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>Educational implementation of customer journey mapping concepts.</p>
+  </footer>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
