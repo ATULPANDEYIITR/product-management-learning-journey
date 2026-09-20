@@ -125,3 +125,95 @@ def analyze_journey(journey: JourneyMap) -> JourneyAnalysis:
         weakest_stage=weakest_stage,
         channel_frequency=dict(channels),
     )
+
+# File: backend/tests/test_main.py
+from fastapi.testclient import TestClient
+
+from app.main import app
+
+
+client = TestClient(app)
+
+
+def sample_journey() -> dict:
+    return {
+        "persona": "First-time SaaS buyer",
+        "scenario": "Evaluating a project-management platform",
+        "stages": [
+            {
+                "name": "awareness",
+                "customer_goal": "Discover a solution",
+                "customer_actions": ["Search online"],
+                "thoughts": ["Can this solve my problem?"],
+                "emotions": ["Curious"],
+                "pain_points": ["Too many alternatives"],
+                "opportunities": ["Publish educational content"],
+                "touchpoints": [
+                    {
+                        "channel": "Search",
+                        "description": "Search engine result",
+                        "sentiment": 2,
+                        "effort": 2,
+                        "frequency": 4,
+                    }
+                ],
+            },
+            {
+                "name": "purchase",
+                "customer_goal": "Choose a product",
+                "customer_actions": ["Compare plans", "Start checkout"],
+                "thoughts": ["Is the price justified?"],
+                "emotions": ["Cautious"],
+                "pain_points": ["Pricing is unclear"],
+                "opportunities": ["Explain plans clearly"],
+                "touchpoints": [
+                    {
+                        "channel": "Website",
+                        "description": "Pricing page",
+                        "sentiment": -2,
+                        "effort": 4,
+                        "frequency": 3,
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def test_health() -> None:
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ok"
+
+
+def test_analyze_journey() -> None:
+    response = client.post("/api/journeys/analyze", json=sample_journey())
+
+    assert response.status_code == 200
+
+    result = response.json()
+
+    assert result["total_touchpoints"] == 2
+    assert result["pain_point_count"] == 2
+    assert result["opportunity_count"] == 2
+    assert result["weakest_stage"] == "purchase"
+
+
+def test_invalid_sentiment_is_rejected() -> None:
+    journey = sample_journey()
+    journey["stages"][0]["touchpoints"][0]["sentiment"] = 9
+
+    response = client.post("/api/journeys/analyze", json=journey)
+
+    assert response.status_code == 422
+
+
+def test_missing_persona_is_rejected() -> None:
+    journey = sample_journey()
+    del journey["persona"]
+
+    response = client.post("/api/journeys/analyze", json=journey)
+
+    assert response.status_code == 422
+
+
