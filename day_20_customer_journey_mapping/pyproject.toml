@@ -1,0 +1,41 @@
+# File: pyproject.toml
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "customer-journey-mapping-lab"
+version = "1.0.0"
+description = "Educational customer journey mapping and analysis application."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.116.1",
+    "uvicorn[standard]==0.35.0",
+    "pydantic==2.11.7",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest==8.4.1",
+    "httpx==0.28.1",
+]
+dev = [
+    "ruff==0.12.10",
+    "pytest==8.4.1",
+    "httpx==0.28.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+pythonpath = ["backend"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.setuptools.packages.find]
+where = ["backend"]
