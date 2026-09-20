@@ -1,0 +1,197 @@
+/* File: frontend/style.css */
+:root {
+  color-scheme: dark;
+  font-family: Inter, system-ui, sans-serif;
+  background: #090b10;
+  color: #f4f7fb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at top right, #20263a, transparent 40%),
+    #090b10;
+}
+
+.hero,
+main,
+footer {
+  width: min(1400px, 94%);
+  margin-inline: auto;
+}
+
+.hero {
+  padding: 60px 0 35px;
+}
+
+.eyebrow {
+  letter-spacing: 0.16em;
+  font-size: 0.75rem;
+  color: #8fa4c7;
+}
+
+h1 {
+  font-size: clamp(2.2rem, 5vw, 4.5rem);
+  margin: 0;
+}
+
+h2 {
+  margin-bottom: 8px;
+}
+
+.hero p:last-child,
+.section-heading p {
+  color: #aeb8c9;
+  max-width: 800px;
+  line-height: 1.7;
+}
+
+.profile,
+.stage-card,
+.analysis {
+  border: 1px solid #252c3a;
+  background: #10141d;
+  border-radius: 18px;
+}
+
+.profile {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 20px;
+  padding: 24px;
+  margin-bottom: 45px;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: #c7d0df;
+  font-size: 0.9rem;
+}
+
+input,
+textarea {
+  width: 100%;
+  border: 1px solid #30394a;
+  border-radius: 10px;
+  background: #0a0d13;
+  color: #fff;
+  padding: 12px;
+  font: inherit;
+}
+
+textarea {
+  min-height: 80px;
+  resize: vertical;
+}
+
+.stage-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+}
+
+.stage-card {
+  padding: 22px;
+}
+
+.stage-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 22px;
+}
+
+.stage-number {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: #263147;
+  color: #dce8ff;
+}
+
+.stage-card > label {
+  margin-bottom: 16px;
+}
+
+.touchpoint {
+  border-top: 1px solid #2b3342;
+  padding-top: 18px;
+}
+
+.touchpoint h3 {
+  font-size: 1rem;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.analysis {
+  padding: 28px;
+  margin: 50px 0;
+}
+
+button {
+  border: 0;
+  border-radius: 10px;
+  padding: 13px 20px;
+  background: #dbe7ff;
+  color: #0b0e14;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.analysis-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 12px;
+  margin-top: 25px;
+}
+
+.metric {
+  border: 1px solid #30394a;
+  border-radius: 12px;
+  padding: 18px;
+}
+
+.metric strong,
+.metric span {
+  display: block;
+}
+
+.metric strong {
+  font-size: 1.7rem;
+}
+
+.metric span {
+  color: #9da8ba;
+  margin-top: 5px;
+}
+
+footer {
+  padding: 20px 0 50px;
+  color: #7f8999;
+}
+
+@media (max-width: 900px) {
+  .profile,
+  .stage-grid,
+  .analysis-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .metrics {
+    grid-template-columns: 1fr;
+  }
+}
