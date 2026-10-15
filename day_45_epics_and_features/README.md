@@ -1,850 +1,269 @@
--- PostgreSQL 15+
--- Relational product-planning model for epics, features, stories, and tasks.
---
--- The schema distinguishes parent-child decomposition from dependencies.
--- Story points are stored only on stories; hours are stored only on tasks.
--- Aggregate progress is calculated from leaf-level delivery estimates.
--- This script runs in a transaction and recreates its demonstration schema.
-
-BEGIN;
-
-DROP SCHEMA IF EXISTS product_planning CASCADE;
-CREATE SCHEMA product_planning;
-SET search_path TO product_planning, public;
-
-CREATE TYPE work_type AS ENUM ('epic', 'feature', 'story', 'task');
-
-CREATE TYPE work_status AS ENUM (
-    'backlog',
-    'ready',
-    'in_progress',
-    'blocked',
-    'done',
-    'cancelled'
-);
-
-CREATE TYPE work_priority AS ENUM (
-    'low',
-    'medium',
-    'high',
-    'critical'
-);
-
-CREATE TABLE teams (
-    team_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    team_name TEXT NOT NULL UNIQUE,
-    active BOOLEAN NOT NULL DEFAULT TRUE
-);
-
-CREATE TABLE team_members (
-    member_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    team_id BIGINT NOT NULL REFERENCES teams(team_id),
-    display_name TEXT NOT NULL,
-    email TEXT NOT NULL UNIQUE,
-    active BOOLEAN NOT NULL DEFAULT TRUE,
-    UNIQUE (team_id, member_id)
-);
-
-CREATE TABLE products (
-    product_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    product_key TEXT NOT NULL UNIQUE,
-    product_name TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE work_items (
-    work_item_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    product_id BIGINT NOT NULL REFERENCES products(product_id),
-    item_key TEXT NOT NULL UNIQUE,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    item_type work_type NOT NULL,
-    parent_id BIGINT REFERENCES work_items(work_item_id),
-    status work_status NOT NULL DEFAULT 'backlog',
-    priority work_priority NOT NULL DEFAULT 'medium',
-    owner_id BIGINT REFERENCES team_members(member_id),
-    story_points NUMERIC(7,2),
-    estimate_hours NUMERIC(9,2),
-    due_date DATE,
-    version INTEGER NOT NULL DEFAULT 1,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-    CONSTRAINT ck_item_key_not_blank CHECK (length(trim(item_key)) > 0),
-    CONSTRAINT ck_title_not_blank CHECK (length(trim(title)) > 0),
-    CONSTRAINT ck_version_positive CHECK (version > 0),
-    CONSTRAINT ck_nonnegative_story_points CHECK (
-        story_points IS NULL OR story_points >= 0
-    ),
-    CONSTRAINT ck_nonnegative_estimate_hours CHECK (
-        estimate_hours IS NULL OR estimate_hours >= 0
-    ),
-    CONSTRAINT ck_story_points_only_on_stories CHECK (
-        story_points IS NULL OR item_type = 'story'
-    ),
-    CONSTRAINT ck_hours_only_on_tasks CHECK (
-        estimate_hours IS NULL OR item_type = 'task'
-    ),
-    CONSTRAINT ck_epic_has_no_parent CHECK (
-        item_type <> 'epic' OR parent_id IS NULL
-    ),
-    CONSTRAINT ck_non_epic_has_parent CHECK (
-        item_type = 'epic' OR parent_id IS NOT NULL
-    ),
-    CONSTRAINT ck_not_own_parent CHECK (
-        parent_id IS NULL OR parent_id <> work_item_id
-    ),
-    CONSTRAINT uq_item_product_id UNIQUE (product_id, work_item_id)
-);
-
-CREATE INDEX idx_work_items_parent
-    ON work_items(parent_id, item_type, status);
-
-CREATE INDEX idx_work_items_product_status
-    ON work_items(product_id, status, priority);
-
-CREATE INDEX idx_work_items_owner
-    ON work_items(owner_id, status)
-    WHERE owner_id IS NOT NULL;
-
-CREATE TABLE acceptance_criteria (
-    criterion_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    story_id BIGINT NOT NULL REFERENCES work_items(work_item_id)
-        ON DELETE CASCADE,
-    criterion_text TEXT NOT NULL,
-    position INTEGER NOT NULL CHECK (position > 0),
-    verified BOOLEAN NOT NULL DEFAULT FALSE,
-    UNIQUE (story_id, position),
-    CHECK (length(trim(criterion_text)) > 0)
-);
-
-CREATE TABLE work_dependencies (
-    work_item_id BIGINT NOT NULL REFERENCES work_items(work_item_id)
-        ON DELETE CASCADE,
-    depends_on_id BIGINT NOT NULL REFERENCES work_items(work_item_id),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (work_item_id, depends_on_id),
-    CHECK (work_item_id <> depends_on_id)
-);
-
-CREATE INDEX idx_dependencies_target
-    ON work_dependencies(depends_on_id);
-
-CREATE TABLE status_history (
-    history_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    work_item_id BIGINT NOT NULL REFERENCES work_items(work_item_id),
-    previous_status work_status,
-    new_status work_status NOT NULL,
-    changed_by BIGINT REFERENCES team_members(member_id),
-    changed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    reason TEXT NOT NULL DEFAULT ''
-);
-
-CREATE INDEX idx_status_history_item_time
-    ON status_history(work_item_id, changed_at DESC);
-
--- Enforce the exact hierarchy and prevent cross-product parent relationships.
-CREATE FUNCTION validate_work_item_hierarchy()
-RETURNS TRIGGER
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    parent_type work_type;
-    parent_product BIGINT;
-BEGIN
-    IF NEW.item_type = 'epic' THEN
-        IF NEW.parent_id IS NOT NULL THEN
-            RAISE EXCEPTION 'An epic cannot have a parent';
-        END IF;
-        RETURN NEW;
-    END IF;
-
-    IF NEW.parent_id IS NULL THEN
-        RAISE EXCEPTION '% requires a parent', NEW.item_type;
-    END IF;
-
-    SELECT item_type, product_id
-    INTO parent_type, parent_product
-    FROM work_items
-    WHERE work_item_id = NEW.parent_id;
-
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'Parent work item % does not exist', NEW.parent_id;
-    END IF;
-
-    IF parent_product <> NEW.product_id THEN
-        RAISE EXCEPTION 'Parent and child must belong to the same product';
-    END IF;
-
-    IF (NEW.item_type = 'feature' AND parent_type <> 'epic')
-       OR (NEW.item_type = 'story' AND parent_type <> 'feature')
-       OR (NEW.item_type = 'task' AND parent_type <> 'story') THEN
-        RAISE EXCEPTION 'Invalid hierarchy: % cannot be a child of %',
-            NEW.item_type, parent_type;
-    END IF;
-
-    RETURN NEW;
-END;
-$$;
-
-CREATE TRIGGER trg_validate_work_item_hierarchy
-BEFORE INSERT OR UPDATE OF item_type, parent_id, product_id
-ON work_items
-FOR EACH ROW
-EXECUTE FUNCTION validate_work_item_hierarchy();
-
--- Acceptance criteria must belong to stories, not epics, features, or tasks.
-CREATE FUNCTION validate_acceptance_criterion()
-RETURNS TRIGGER
-LANGUAGE plpgsql
-AS $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1
-        FROM work_items
-        WHERE work_item_id = NEW.story_id
-          AND item_type = 'story'
-    ) THEN
-        RAISE EXCEPTION 'Acceptance criteria can only belong to stories';
-    END IF;
-
-    RETURN NEW;
-END;
-$$;
-
-CREATE TRIGGER trg_validate_acceptance_criterion
-BEFORE INSERT OR UPDATE ON acceptance_criteria
-FOR EACH ROW
-EXECUTE FUNCTION validate_acceptance_criterion();
-
--- Validate dependency targets and reject dependency cycles.
-CREATE FUNCTION validate_dependency()
-RETURNS TRIGGER
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    source_product BIGINT;
-    target_product BIGINT;
-BEGIN
-    SELECT product_id INTO source_product
-    FROM work_items
-    WHERE work_item_id = NEW.work_item_id;
-
-    SELECT product_id INTO target_product
-    FROM work_items
-    WHERE work_item_id = NEW.depends_on_id;
-
-    IF source_product IS NULL OR target_product IS NULL THEN
-        RAISE EXCEPTION 'Both dependency work items must exist';
-    END IF;
-
-    IF source_product <> target_product THEN
-        RAISE EXCEPTION 'Dependencies must remain within one product';
-    END IF;
-
-    IF EXISTS (
-        WITH RECURSIVE dependency_path(item_id) AS (
-            SELECT depends_on_id
-            FROM work_dependencies
-            WHERE work_item_id = NEW.depends_on_id
-
-            UNION
-
-            SELECT dependency.depends_on_id
-            FROM work_dependencies dependency
-            JOIN dependency_path path
-              ON dependency.work_item_id = path.item_id
-        )
-        SELECT 1
-        FROM dependency_path
-        WHERE item_id = NEW.work_item_id
-    ) THEN
-        RAISE EXCEPTION 'Dependency would introduce a cycle';
-    END IF;
-
-    RETURN NEW;
-END;
-$$;
-
-CREATE TRIGGER trg_validate_dependency
-BEFORE INSERT OR UPDATE ON work_dependencies
-FOR EACH ROW
-EXECUTE FUNCTION validate_dependency();
-
--- State transitions are recorded as part of the same database transaction.
-CREATE FUNCTION record_work_item_status_change()
-RETURNS TRIGGER
-LANGUAGE plpgsql
-AS $$
-BEGIN
-    IF NEW.status IS DISTINCT FROM OLD.status THEN
-        IF NOT (
-            (OLD.status = 'backlog'
-                AND NEW.status IN ('ready', 'cancelled'))
-            OR
-            (OLD.status = 'ready'
-                AND NEW.status IN ('in_progress', 'blocked', 'cancelled'))
-            OR
-            (OLD.status = 'in_progress'
-                AND NEW.status IN ('ready', 'blocked', 'done', 'cancelled'))
-            OR
-            (OLD.status = 'blocked'
-                AND NEW.status IN ('ready', 'in_progress', 'cancelled'))
-            OR
-            (OLD.status = 'done' AND NEW.status = 'ready')
-            OR
-            (OLD.status = 'cancelled' AND NEW.status = 'backlog')
-        ) THEN
-            RAISE EXCEPTION 'Invalid status transition: % -> %',
-                OLD.status, NEW.status;
-        END IF;
-
-        IF NEW.status = 'in_progress' AND EXISTS (
-            SELECT 1
-            FROM work_dependencies dependency
-            JOIN work_items prerequisite
-              ON prerequisite.work_item_id = dependency.depends_on_id
-            WHERE dependency.work_item_id = NEW.work_item_id
-              AND prerequisite.status <> 'done'
-        ) THEN
-            RAISE EXCEPTION 'Work cannot start with unfinished dependencies';
-        END IF;
-
-        IF NEW.status = 'done' AND NEW.item_type = 'story' AND EXISTS (
-            SELECT 1
-            FROM work_items task
-            WHERE task.parent_id = NEW.work_item_id
-              AND task.status NOT IN ('done', 'cancelled')
-        ) THEN
-            RAISE EXCEPTION 'Story cannot complete with unfinished tasks';
-        END IF;
-
-        IF NEW.status = 'done'
-           AND NEW.item_type IN ('epic', 'feature')
-           AND EXISTS (
-               WITH RECURSIVE descendants(item_id, item_type, status) AS (
-                   SELECT child.work_item_id, child.item_type, child.status
-                   FROM work_items child
-                   WHERE child.parent_id = NEW.work_item_id
-
-                   UNION ALL
-
-                   SELECT child.work_item_id, child.item_type, child.status
-                   FROM work_items child
-                   JOIN descendants parent
-                     ON child.parent_id = parent.item_id
-               )
-               SELECT 1
-               FROM descendants
-               WHERE item_type IN ('story', 'task')
-                 AND status NOT IN ('done', 'cancelled')
-           ) THEN
-            RAISE EXCEPTION 'Aggregate work has unfinished descendants';
-        END IF;
-
-        NEW.version := OLD.version + 1;
-        NEW.updated_at := CURRENT_TIMESTAMP;
-
-        INSERT INTO status_history (
-            work_item_id, previous_status, new_status
-        )
-        VALUES (
-            OLD.work_item_id, OLD.status, NEW.status
-        );
-    END IF;
-
-    RETURN NEW;
-END;
-$$;
-
-CREATE TRIGGER trg_record_status_change
-BEFORE UPDATE OF status ON work_items
-FOR EACH ROW
-EXECUTE FUNCTION record_work_item_status_change();
-
-CREATE TABLE planning_audit_log (
-    audit_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    entity_type TEXT NOT NULL,
-    entity_key TEXT NOT NULL,
-    action TEXT NOT NULL,
-    details JSONB NOT NULL DEFAULT '{}'::jsonb,
-    occurred_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE FUNCTION audit_work_item_changes()
-RETURNS TRIGGER
-LANGUAGE plpgsql
-AS $$
-BEGIN
-    INSERT INTO planning_audit_log(entity_type, entity_key, action, details)
-    VALUES (
-        'work_item',
-        NEW.item_key,
-        CASE WHEN TG_OP = 'INSERT' THEN 'created' ELSE 'updated' END,
-        jsonb_build_object(
-            'status', NEW.status,
-            'priority', NEW.priority,
-            'owner_id', NEW.owner_id,
-            'version', NEW.version
-        )
-    );
-
-    RETURN NEW;
-END;
-$$;
-
-CREATE TRIGGER trg_audit_work_item_changes
-AFTER INSERT OR UPDATE ON work_items
-FOR EACH ROW
-EXECUTE FUNCTION audit_work_item_changes();
-
--- Product planning policy data is distinct from the work hierarchy.
-CREATE TABLE delivery_policies (
-    policy_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    product_id BIGINT NOT NULL UNIQUE REFERENCES products(product_id),
-    minimum_story_points NUMERIC(7,2) NOT NULL DEFAULT 0
-        CHECK (minimum_story_points >= 0),
-    require_story_owners BOOLEAN NOT NULL DEFAULT TRUE,
-    require_task_owners BOOLEAN NOT NULL DEFAULT TRUE,
-    require_verified_acceptance_criteria BOOLEAN NOT NULL DEFAULT FALSE,
-    forbid_blocked_work BOOLEAN NOT NULL DEFAULT TRUE,
-    require_estimates BOOLEAN NOT NULL DEFAULT TRUE
-);
-
-INSERT INTO teams(team_name) VALUES
-    ('Product Management'),
-    ('Platform Engineering'),
-    ('Quality Engineering'),
-    ('Security Engineering');
-
-INSERT INTO team_members(team_id, display_name, email)
-SELECT team_id, 'Product Owner', 'product.owner@example.org'
-FROM teams WHERE team_name = 'Product Management';
-
-INSERT INTO team_members(team_id, display_name, email)
-SELECT team_id, 'Platform Engineer', 'platform.engineer@example.org'
-FROM teams WHERE team_name = 'Platform Engineering';
-
-INSERT INTO team_members(team_id, display_name, email)
-SELECT team_id, 'Quality Engineer', 'quality.engineer@example.org'
-FROM teams WHERE team_name = 'Quality Engineering';
-
-INSERT INTO team_members(team_id, display_name, email)
-SELECT team_id, 'Security Engineer', 'security.engineer@example.org'
-FROM teams WHERE team_name = 'Security Engineering';
-
-INSERT INTO products(product_key, product_name, description)
-VALUES (
-    'GOVDATA',
-    'Government Data Quality Platform',
-    'Configurable data validation and evidence management for public services.'
-);
-
-INSERT INTO delivery_policies(
-    product_id,
-    minimum_story_points,
-    require_story_owners,
-    require_task_owners,
-    require_verified_acceptance_criteria,
-    forbid_blocked_work,
-    require_estimates
-)
-SELECT product_id, 13, TRUE, TRUE, TRUE, TRUE, TRUE
-FROM products
-WHERE product_key = 'GOVDATA';
-
--- Parent records are inserted before children to satisfy foreign keys.
-INSERT INTO work_items(
-    product_id, item_key, title, description, item_type,
-    parent_id, status, priority, owner_id, due_date
-)
-SELECT product_id, 'EP-500', 'Data Quality Programme',
-       'Deliver governed validation and inspection workflows.',
-       'epic', NULL, 'backlog', 'critical', member_id,
-       DATE '2026-12-15'
-FROM products
-CROSS JOIN team_members
-WHERE product_key = 'GOVDATA'
-  AND email = 'product.owner@example.org';
-
-INSERT INTO work_items(
-    product_id, item_key, title, description, item_type,
-    parent_id, status, priority, owner_id
-)
-SELECT p.product_id, 'FE-510', 'Validation Rule Management',
-       'Define, version, and execute validation rules.',
-       'feature', epic.work_item_id, 'backlog', 'high', member.member_id
-FROM products p
-JOIN work_items epic ON epic.item_key = 'EP-500'
-JOIN team_members member ON member.email = 'platform.engineer@example.org'
-WHERE p.product_key = 'GOVDATA';
-
-INSERT INTO work_items(
-    product_id, item_key, title, description, item_type,
-    parent_id, status, priority, owner_id, story_points
-)
-SELECT p.product_id, 'ST-511',
-       'As a data steward, I can define a required-field rule',
-       'Configure required-field checks for incoming datasets.',
-       'story', feature.work_item_id, 'backlog', 'high', member.member_id, 5
-FROM products p
-JOIN work_items feature ON feature.item_key = 'FE-510'
-JOIN team_members member ON member.email = 'platform.engineer@example.org'
-WHERE p.product_key = 'GOVDATA';
-
-INSERT INTO acceptance_criteria(story_id, criterion_text, position)
-SELECT work_item_id, 'A required-field rule detects missing values.', 1
-FROM work_items WHERE item_key = 'ST-511';
-
-INSERT INTO acceptance_criteria(story_id, criterion_text, position)
-SELECT work_item_id, 'Validation results record failed-row counts.', 2
-FROM work_items WHERE item_key = 'ST-511';
-
-INSERT INTO work_items(
-    product_id, item_key, title, description, item_type,
-    parent_id, status, priority, owner_id, estimate_hours
-)
-SELECT p.product_id, 'TS-511A', 'Persist validation rule definitions',
-       'Store rule configuration and version metadata.',
-       'task', story.work_item_id, 'backlog', 'high', member.member_id, 8
-FROM products p
-JOIN work_items story ON story.item_key = 'ST-511'
-JOIN team_members member ON member.email = 'platform.engineer@example.org'
-WHERE p.product_key = 'GOVDATA';
-
-INSERT INTO work_items(
-    product_id, item_key, title, description, item_type,
-    parent_id, status, priority, owner_id, estimate_hours
-)
-SELECT p.product_id, 'TS-511B', 'Test validation execution',
-       'Verify required-field behavior against representative datasets.',
-       'task', story.work_item_id, 'backlog', 'medium', member.member_id, 5
-FROM products p
-JOIN work_items story ON story.item_key = 'ST-511'
-JOIN team_members member ON member.email = 'quality.engineer@example.org'
-WHERE p.product_key = 'GOVDATA';
-
-INSERT INTO work_dependencies(work_item_id, depends_on_id)
-SELECT dependent.work_item_id, prerequisite.work_item_id
-FROM work_items dependent
-CROSS JOIN work_items prerequisite
-WHERE dependent.item_key = 'TS-511B'
-  AND prerequisite.item_key = 'TS-511A';
-
-INSERT INTO work_items(
-    product_id, item_key, title, description, item_type,
-    parent_id, status, priority, owner_id, story_points
-)
-SELECT p.product_id, 'ST-512',
-       'As a steward, I can inspect failed validation records',
-       'Inspect failed records without exposing unauthorized data.',
-       'story', feature.work_item_id, 'backlog', 'high', member.member_id, 8
-FROM products p
-JOIN work_items feature ON feature.item_key = 'FE-510'
-JOIN team_members member ON member.email = 'platform.engineer@example.org'
-WHERE p.product_key = 'GOVDATA';
-
-INSERT INTO acceptance_criteria(story_id, criterion_text, position)
-SELECT work_item_id,
-       'Each failure identifies the validation rule that was violated.',
-       1
-FROM work_items WHERE item_key = 'ST-512';
-
-INSERT INTO acceptance_criteria(story_id, criterion_text, position)
-SELECT work_item_id,
-       'Standard reports mask sensitive field values.',
-       2
-FROM work_items WHERE item_key = 'ST-512';
-
--- Recursive view: each work item is associated with its ancestor epic.
-CREATE VIEW epic_work_breakdown AS
-WITH RECURSIVE hierarchy AS (
-    SELECT
-        work_item_id,
-        item_key,
-        title,
-        item_type,
-        status,
-        parent_id,
-        work_item_id AS root_id,
-        0 AS depth
-    FROM work_items
-    WHERE item_type = 'epic'
-
-    UNION ALL
-
-    SELECT
-        child.work_item_id,
-        child.item_key,
-        child.title,
-        child.item_type,
-        child.status,
-        child.parent_id,
-        hierarchy.root_id,
-        hierarchy.depth + 1
-    FROM work_items child
-    JOIN hierarchy
-      ON child.parent_id = hierarchy.work_item_id
-)
-SELECT
-    root.item_key AS epic_key,
-    hierarchy.item_key,
-    hierarchy.title,
-    hierarchy.item_type,
-    hierarchy.status,
-    hierarchy.parent_id,
-    hierarchy.root_id,
-    hierarchy.depth
-FROM hierarchy
-JOIN work_items root ON root.work_item_id = hierarchy.root_id;
-
--- Calculate progress from story estimates without adding task hours to points.
-CREATE VIEW epic_progress AS
-WITH story_rollup AS (
-    SELECT
-        epic.root_id AS epic_id,
-        COUNT(*) FILTER (
-            WHERE hierarchy.item_type = 'story'
-              AND hierarchy.status <> 'cancelled'
-        ) AS story_count,
-        COUNT(*) FILTER (
-            WHERE hierarchy.item_type = 'story'
-              AND hierarchy.status = 'done'
-        ) AS completed_story_count,
-        COUNT(*) FILTER (
-            WHERE hierarchy.item_type = 'story'
-              AND hierarchy.status <> 'cancelled'
-              AND story.story_points IS NULL
-        ) AS unestimated_story_count,
-        COALESCE(SUM(story.story_points) FILTER (
-            WHERE hierarchy.item_type = 'story'
-              AND hierarchy.status <> 'cancelled'
-        ), 0) AS total_story_points,
-        COALESCE(SUM(story.story_points) FILTER (
-            WHERE hierarchy.item_type = 'story'
-              AND hierarchy.status = 'done'
-        ), 0) AS completed_story_points
-    FROM epic_work_breakdown hierarchy
-    JOIN work_items epic ON epic.work_item_id = hierarchy.root_id
-    JOIN work_items story ON story.work_item_id = hierarchy.work_item_id
-    GROUP BY epic.root_id
-)
-SELECT
-    epic_id,
-    story_count,
-    completed_story_count,
-    unestimated_story_count,
-    total_story_points,
-    completed_story_points,
-    total_story_points - completed_story_points AS remaining_story_points,
-    CASE
-        WHEN total_story_points = 0 THEN 0
-        ELSE ROUND(
-            completed_story_points / total_story_points * 100,
-            2
-        )
-    END AS percent_complete
-FROM story_rollup;
-
--- Policy-oriented report: every row explains a concrete readiness failure.
-CREATE VIEW work_item_readiness_issues AS
-SELECT
-    item.work_item_id,
-    item.item_key,
-    'missing_owner'::TEXT AS issue_code,
-    'Work item has no accountable owner'::TEXT AS issue_detail
-FROM work_items item
-JOIN delivery_policies policy ON policy.product_id = item.product_id
-WHERE item.status <> 'cancelled'
-  AND (
-      (item.item_type = 'story'
-       AND policy.require_story_owners
-       AND item.owner_id IS NULL)
-      OR
-      (item.item_type = 'task'
-       AND policy.require_task_owners
-       AND item.owner_id IS NULL)
-  )
-
-UNION ALL
-
-SELECT
-    item.work_item_id,
-    item.item_key,
-    'missing_estimate',
-    'Work item is not estimated'
-FROM work_items item
-JOIN delivery_policies policy ON policy.product_id = item.product_id
-WHERE policy.require_estimates
-  AND item.status <> 'cancelled'
-  AND (
-      (item.item_type = 'story' AND item.story_points IS NULL)
-      OR
-      (item.item_type = 'task' AND item.estimate_hours IS NULL)
-  )
-
-UNION ALL
-
-SELECT
-    story.work_item_id,
-    story.item_key,
-    'unverified_acceptance_criteria',
-    'At least one acceptance criterion is not verified'
-FROM work_items story
-JOIN delivery_policies policy ON policy.product_id = story.product_id
-WHERE policy.require_verified_acceptance_criteria
-  AND story.item_type = 'story'
-  AND story.status <> 'cancelled'
-  AND EXISTS (
-      SELECT 1
-      FROM acceptance_criteria criterion
-      WHERE criterion.story_id = story.work_item_id
-        AND criterion.verified = FALSE
-  )
-
-UNION ALL
-
-SELECT
-    item.work_item_id,
-    item.item_key,
-    'blocked_work',
-    'Work item is blocked'
-FROM work_items item
-JOIN delivery_policies policy ON policy.product_id = item.product_id
-WHERE policy.forbid_blocked_work
-  AND item.status = 'blocked';
-
--- A reporting query for the complete hierarchy.
-SELECT
-    epic_key,
-    repeat('  ', depth) || item_key AS indented_key,
-    item_type,
-    title,
-    status
-FROM epic_work_breakdown
-ORDER BY epic_key, depth, item_key;
-
--- Epic progress report.
-SELECT
-    epic.item_key AS epic_key,
-    progress.story_count,
-    progress.completed_story_count,
-    progress.total_story_points,
-    progress.completed_story_points,
-    progress.remaining_story_points,
-    progress.percent_complete,
-    progress.unestimated_story_count
-FROM epic_progress progress
-JOIN work_items epic ON epic.work_item_id = progress.epic_id
-ORDER BY epic.item_key;
-
--- Dependency report exposes prerequisites that have not completed.
-SELECT
-    dependent.item_key AS dependent_item,
-    prerequisite.item_key AS prerequisite_item,
-    prerequisite.status AS prerequisite_status
-FROM work_dependencies dependency
-JOIN work_items dependent
-  ON dependent.work_item_id = dependency.work_item_id
-JOIN work_items prerequisite
-  ON prerequisite.work_item_id = dependency.depends_on_id
-WHERE prerequisite.status <> 'done'
-ORDER BY dependent.item_key;
-
--- Acceptance criteria verification coverage.
-SELECT
-    story.item_key AS story_key,
-    COUNT(criterion.criterion_id) AS criterion_count,
-    COUNT(criterion.criterion_id) FILTER (
-        WHERE criterion.verified
-    ) AS verified_count,
-    CASE
-        WHEN COUNT(criterion.criterion_id) = 0 THEN 0
-        ELSE ROUND(
-            COUNT(criterion.criterion_id) FILTER (WHERE criterion.verified)
-            * 100.0 / COUNT(criterion.criterion_id),
-            2
-        )
-    END AS verification_percent
-FROM work_items story
-LEFT JOIN acceptance_criteria criterion
-  ON criterion.story_id = story.work_item_id
-WHERE story.item_type = 'story'
-GROUP BY story.work_item_id, story.item_key
-ORDER BY story.item_key;
-
--- Readiness issues are data, not merely a Boolean result.
-SELECT *
-FROM work_item_readiness_issues
-ORDER BY item_key, issue_code;
-
--- Demonstrate a valid dependency-aware task transition.
--- The first task can start because it has no prerequisite.
-UPDATE work_items
-SET status = 'ready'
-WHERE item_key = 'TS-511A';
-
-UPDATE work_items
-SET status = 'in_progress'
-WHERE item_key = 'TS-511A';
-
-UPDATE work_items
-SET status = 'done'
-WHERE item_key = 'TS-511A';
-
--- The dependent task can now start because its prerequisite is complete.
-UPDATE work_items
-SET status = 'ready'
-WHERE item_key = 'TS-511B';
-
-UPDATE work_items
-SET status = 'in_progress'
-WHERE item_key = 'TS-511B';
-
-UPDATE work_items
-SET status = 'done'
-WHERE item_key = 'TS-511B';
-
--- A story can complete after its tasks are terminal.
-UPDATE work_items
-SET status = 'ready'
-WHERE item_key = 'ST-511';
-
-UPDATE work_items
-SET status = 'in_progress'
-WHERE item_key = 'ST-511';
-
-UPDATE work_items
-SET status = 'done'
-WHERE item_key = 'ST-511';
-
-SELECT
-    item_key,
-    status,
-    version,
-    updated_at
-FROM work_items
-WHERE item_key IN ('ST-511', 'TS-511A', 'TS-511B')
-ORDER BY item_key;
-
-SELECT
-    item.item_key,
-    history.previous_status,
-    history.new_status,
-    history.changed_at,
-    history.reason
-FROM status_history history
-JOIN work_items item ON item.work_item_id = history.work_item_id
-ORDER BY history.history_id;
-
-SELECT
-    entity_key,
-    action,
-    details,
-    occurred_at
-FROM planning_audit_log
-ORDER BY audit_id;
-
--- This transaction makes the demonstration repeatable.
-ROLLBACK;
+# Epic and Feature Management
+
+## Purpose and domain model
+
+Epics and features organize product work at different levels of abstraction. An epic describes a significant business outcome that usually requires several related capabilities. A feature describes a specific capability that contributes to that outcome and can be planned, implemented, tested, and delivered.
+
+A useful hierarchy connects strategic intent to verifiable delivery:
+
+- **Epic:** A broad outcome, such as reducing the time required to onboard enterprise customers.
+- **Feature:** A meaningful capability, such as identity verification, customer profile capture, eligibility assessment, or an auditable decision trail.
+- **Acceptance criteria:** Testable statements defining the conditions under which a feature is acceptable.
+- **Dependency:** A relationship indicating that one feature requires another capability to be available first.
+- **Release:** A delivery window with a target date and a finite amount of implementation capacity.
+- **Priority:** A relative business ordering used to guide decisions when time, capacity, or resources are constrained.
+
+An epic should express a business outcome rather than merely collect unrelated tasks. A feature should describe a capability with a clear owner and observable acceptance conditions. An implementation team may further decompose features into stories and technical tasks, but those lower-level items are not required to represent the relationship between epics and features in these programs.
+
+## How epics differ from features
+
+| Dimension | Epic | Feature |
+|---|---|---|
+| Primary purpose | Organize a substantial business outcome | Deliver a defined product capability |
+| Scope | Spans multiple capabilities or delivery increments | Has a more bounded implementation scope |
+| Ownership | Accountable product or business owner | Product, engineering, or specialist delivery owner |
+| Planning | Outcome, broad schedule, and investment | Estimate, acceptance criteria, dependencies, and release |
+| Progress | Aggregated from child features | Determined by its own lifecycle and completion evidence |
+| Completion | Requires all child features to reach a terminal state | Requires satisfied dependencies and validated acceptance criteria |
+| Change management | Reassesses scope and the intended outcome | Reassesses capability boundaries, estimates, and dependencies |
+
+The distinction is structural, not merely a difference in title. An epic can remain strategically valuable while individual features change, split, move to a later release, or become unnecessary. Feature completion does not automatically establish that the overall business outcome has been achieved. The outcome metric must still be measured against its baseline and target.
+
+## Feature decomposition and business traceability
+
+Consider an enterprise customer-onboarding program. Its intended outcome is to reduce manual onboarding effort without weakening identity and eligibility controls.
+
+The epic can contain these related capabilities:
+
+| Feature | Purpose | Dependency |
+|---|---|---|
+| Identity verification | Validate customer identity using approved evidence | None |
+| Customer profile capture | Collect and validate required customer information | Identity verification |
+| Eligibility assessment | Apply documented eligibility rules to the application | Customer profile capture |
+| Decision audit trail | Record decision inputs, outcomes, and accountable ownership | Eligibility assessment |
+
+The dependency chain defines an implementation order. It does not mean that every feature must be delivered in the same release. A feature can be planned for a later release, provided the release plan accounts for prerequisites and avoids committing a capability whose required foundation will not be available.
+
+Each feature should have a named owner, a non-negative estimate, a target date where applicable, and acceptance criteria that can be evaluated independently. For example, a criterion for eligibility assessment might state that incomplete applications cannot be approved. The criterion is meaningful because a test can establish whether the system enforces that rule.
+
+## Lifecycle and progress semantics
+
+The implementations use a controlled work-item lifecycle:
+
+| State | Meaning |
+|---|---|
+| `proposed` | The work item has been identified but is not yet planned |
+| `planned` | The work item has been accepted into the delivery plan |
+| `in_progress` | Implementation or validation is underway |
+| `blocked` | Progress is prevented by a dependency or another impediment |
+| `done` | Required completion conditions have been satisfied |
+| `cancelled` | The work item will not be delivered in its current form |
+
+Transitions are restricted to valid paths. A proposed feature can become planned or cancelled. A planned feature can start or be cancelled. An active feature can become blocked, complete, or cancelled. A blocked feature can resume or be cancelled. Completed and cancelled items are terminal in these examples.
+
+These rules prevent invalid lifecycle changes, such as moving a completed feature back into active development without an explicit reopening policy. Real organizations may introduce a separate reopening workflow, but it should be intentional and audited rather than silently bypassing completion rules.
+
+An epic's progress can be calculated by counting completed features or by weighting completed work using estimates. These calculations answer different questions.
+
+Feature-count progress treats a small capability and a large capability equally. Point-weighted progress estimates the share of planned effort represented by completed features:
+
+`weighted progress = completed feature points / total feature points × 100`
+
+Neither measure proves business value has been realized. Both are delivery indicators, and both can be misleading if estimates are inconsistent, scope changes without recalculation, or cancelled features remain in the denominator. Production reporting should explicitly define how cancellations, scope changes, and unestimated features affect the calculation.
+
+## Python implementation
+
+The Python program implements an in-memory planning portfolio using `Epic`, `Feature`, `WorkItem`, and `Portfolio` classes.
+
+### Domain representation
+
+`WorkItem` contains the common identity, ownership, priority, status, schedule, and estimate fields. `Feature` adds acceptance criteria, dependency identifiers, and release assignment. `Epic` adds a business outcome and a collection of child features.
+
+The dataclasses provide readable domain structures, while enumerations constrain priorities and lifecycle states. Constructor validation rejects missing identifiers, empty titles, missing owners, negative estimates, and invalid date ranges.
+
+The portfolio maintains separate dictionaries for epics and features. A parent mapping records which epic contains each feature. Keeping these structures separate makes it possible to validate globally unique identifiers and perform direct feature lookups without repeatedly scanning every epic.
+
+### Dependency validation
+
+`Portfolio.set_dependencies()` checks that each referenced feature exists and that the proposed graph remains acyclic. Its depth-first search tracks both the current traversal path and previously visited nodes. Encountering a node already on the current path identifies a cycle.
+
+Dependency updates are transactional at the application level: the previous dependency set is restored if validation fails. This prevents an invalid proposed relationship from leaving the in-memory model inconsistent.
+
+### Planning and reporting
+
+`progress()` calculates feature-count and point-weighted completion. `ready_features()` identifies active features whose direct prerequisites are complete. `prioritize()` orders work by priority, target date, and identifier. `release_capacity()` selects eligible release candidates within a point budget.
+
+Capacity allocation is a planning heuristic rather than an optimal scheduling algorithm. Priority ordering and a simple fit check do not solve every scheduling problem involving team availability, parallel work, deadlines, risk, and dependencies. The distinction matters when converting a planning demonstration into a production planning system.
+
+### Persistence and tests
+
+`to_json()` serializes the portfolio with a schema version, parent relationships, dependency references, and audit events. `save()` writes a temporary file and replaces the destination only after the complete content has been written. This reduces the risk of leaving a partially written destination file, although filesystem durability and concurrent-writer coordination require additional controls in production.
+
+The embedded unit tests cover weighted progress, dependency readiness, cycle rejection, terminal-state enforcement, unknown dependencies, negative capacity, duplicate identifiers, and JSON validity. The executable test suite makes the domain rules verifiable rather than leaving them as comments.
+
+Run the program with `python epic_feature_management.py`. It uses only the Python standard library.
+
+## JavaScript implementation
+
+The JavaScript program focuses on an event-driven planning board rather than duplicating the Python portfolio design.
+
+### Event-driven work-item changes
+
+`PlanningBoard` extends Node.js's `EventEmitter`. It emits domain events when epics and features are created, dependencies change, lifecycle states change, or release candidates are excluded. Each event contains a sequence number, timestamp, event type, and payload.
+
+Consumers can use these events to update a dashboard, produce an audit stream, or notify another service. In this in-memory implementation, event listeners run within the process. Emitting an event is not equivalent to reliably publishing it to an external message broker, and listener failures or process termination can affect delivery guarantees.
+
+### Revision checks and asynchronous policies
+
+Each feature carries a revision counter. A transition supplies the revision observed by the caller. If the current revision differs, the transition fails with a `REVISION_CONFLICT` error.
+
+This is an optimistic concurrency pattern: callers can work from snapshots without acquiring a long-lived lock, but stale updates are rejected. The example demonstrates the rule inside a single Node.js process. A multi-instance service needs atomic revision checks in a shared database or another concurrency-control mechanism.
+
+The asynchronous `evaluateRelease()` function accepts a policy callback. This separates release eligibility from the board's data structures. The caller can check prerequisites or other business rules without embedding every policy inside the planning model.
+
+### Dependency ordering
+
+`DependencyGraph` represents prerequisites as directed edges and uses depth-first traversal to detect cycles and compute a topological order. The resulting order places dependencies before their dependents.
+
+The graph order is useful for reasoning about execution, but it does not determine which work a team should prioritize. The release evaluator separately applies priority ordering, capacity limits, and a supplied policy. Dependency feasibility and capacity feasibility remain distinct checks.
+
+The program uses built-in Node.js modules only. Run it with `node epic_feature_management.js`.
+
+## C++ case study: Utility account modernization
+
+The C++ program models a utility provider's account-modernization initiative. The epic represents the intended business outcome, while features represent identity verification, digital application handling, eligibility decisions, and the audit trail.
+
+### Architecture and data structures
+
+`WorkItem`, `Feature`, `Epic`, and `ReleasePlan` represent the domain. `PlanningEngine` centralizes identifier validation, lifecycle transitions, dependency management, release allocation, and progress reporting.
+
+The implementation uses `std::map` for predictable key-based access, `std::set` for unique dependency identifiers, and `std::vector` for ordered feature collections and release decisions. These standard containers avoid external dependencies and make the data model explicit.
+
+The engine rejects duplicate identifiers, missing parent epics, empty acceptance criteria, negative estimates, and dependencies that reference unknown features. A feature cannot be marked complete while its prerequisites remain unfinished.
+
+### Graph algorithm and complexity
+
+Dependency-cycle validation uses depth-first search. With an adjacency-list representation, graph traversal takes `O(V + E)` time, where `V` is the number of features and `E` is the number of dependency edges. The visited-state map prevents repeated traversal of already processed nodes.
+
+The implementation temporarily applies a proposed dependency set, validates the complete graph, and restores the previous set if a cycle is detected. This keeps a failed planning operation from corrupting the existing dependency structure.
+
+The release planner filters features by release and lifecycle state, sorts them by priority and identifier, and attempts to fit them within a point budget. Sorting costs `O(F log F)` for `F` candidate features, while the subsequent allocation pass is linear.
+
+This greedy allocation is deterministic, but it is not guaranteed to maximize the total number of points or business value delivered. It is appropriate as a transparent baseline for planning discussions, not as a substitute for an optimization model when scheduling constraints become complex.
+
+### Failure handling and relevance
+
+Invalid operations throw `std::invalid_argument`, while the executable catches exceptions at the application boundary and reports a controlled failure. The case study also checks that cyclic dependencies and premature epic completion are rejected.
+
+A production implementation would typically persist changes in a transaction, record who made each change, distinguish delivery commitments from proposals, and account for release-specific compliance requirements. The program demonstrates the domain logic without claiming to provide distributed persistence or a multi-user planning service.
+
+Compile with a C++17-compatible compiler using `g++ -std=c++17 -Wall -Wextra -pedantic`.
+
+## Java implementation: Enterprise planning service
+
+The Java program emphasizes explicit domain types and a service boundary suitable for enterprise application design.
+
+### Domain abstractions
+
+`WorkItem` represents the common properties shared by epics and features. `Epic` holds a `BusinessOutcome` and a collection of child features. `Feature` owns a capability description, immutable acceptance criteria, dependencies, and a release identifier.
+
+The `AcceptanceCriterion`, `BusinessOutcome`, `Progress`, `ReleaseDecision`, and `AuditEntry` records make specific concepts explicit. Records are useful for values that should not expose arbitrary mutation. The mutable lifecycle state remains encapsulated within `WorkItem`.
+
+The use of `List.copyOf()` and `Set.copyOf()` protects collection boundaries from direct modification by callers. This does not make the entire object graph deeply immutable: `Feature` still refers to a mutable `WorkItem`. The design deliberately separates immutable descriptive data from mutable lifecycle state.
+
+### Policy and state management
+
+`WorkflowPolicy` defines valid status transitions independently of `PlanningService`. The service checks the proposed transition and verifies that feature prerequisites have been completed before allowing the feature to reach `DONE`.
+
+`PlanningService` owns the epic and feature registries, validates cross-item references, detects dependency cycles, calculates progress, evaluates release candidates, and records audit events. It also refuses to complete an epic while active child features remain.
+
+The release evaluator combines prerequisite checks, a supplied compliance predicate, and remaining capacity. Every candidate receives an explicit eligibility decision and reason. This makes rejected candidates explainable instead of returning only a list of selected features.
+
+### Exceptions and enterprise boundaries
+
+`PlanningException` represents domain-level failures such as unknown work items, invalid transitions, and incomplete prerequisites. Constructor validation uses `IllegalArgumentException` for malformed values.
+
+The audit trail records lifecycle events in memory with timestamps. In a deployed service, audit records should be durable and protected from unauthorized alteration. Database transactions should coordinate changes to feature state, dependency records, and audit history so that partial updates cannot be mistaken for successful completion.
+
+Compile and run with Java 17 or later:
+
+- `javac EpicFeatureManagement.java`
+- `java EpicFeatureManagement`
+
+## PostgreSQL data model
+
+The SQL implementation uses the `product_planning` schema to represent the relationships between organizational ownership, epics, features, acceptance criteria, dependencies, releases, and lifecycle history.
+
+### Relational structure
+
+| Table | Responsibility |
+|---|---|
+| `teams` | Identifies delivery teams |
+| `product_owners` | Associates accountable people with teams |
+| `releases` | Defines release windows and point capacity |
+| `epics` | Stores business outcomes, target metrics, ownership, and epic status |
+| `features` | Stores capabilities, estimates, priorities, release assignments, and parent epics |
+| `acceptance_criteria` | Stores testable feature requirements and their verification evidence |
+| `feature_dependencies` | Models prerequisite relationships between features |
+| `work_item_history` | Records lifecycle changes for audit and analysis |
+
+Surrogate identity keys provide stable relational references. Human-readable keys such as `EP-ONBOARD` and `FEAT-IDENTITY` provide recognizable business identifiers. Unique constraints prevent duplicate keys, foreign keys enforce valid references, and check constraints reject invalid estimates, empty required text, and reversed date ranges.
+
+The foreign key from `features.epic_id` ensures every feature belongs to an existing epic. The separate dependency table supports many-to-many relationships: one feature can require several prerequisites, and a feature can be a prerequisite for several other features.
+
+### Acceptance criteria and completion integrity
+
+The `acceptance_criteria` table stores criteria individually instead of placing them in a single unstructured field. Its verification columns require a verifier and timestamp when a criterion is marked verified.
+
+The `enforce_feature_completion()` trigger prevents a feature from entering `done` if it has no acceptance criteria, has unverified criteria, or depends on an unfinished feature. This moves an important integrity rule into the database so that a direct SQL update cannot bypass the completion requirement.
+
+A check constraint alone cannot establish whether all rows related to a feature have been verified. The trigger is needed because completion depends on related records rather than only the updated feature row.
+
+### Dependency integrity and recursive queries
+
+A self-referencing foreign key establishes that a prerequisite exists, but it cannot guarantee that the dependency graph is acyclic. The `prevent_feature_dependency_cycle()` trigger uses a recursive common table expression to test whether a proposed edge would create a path back to the dependent feature.
+
+The cycle check prevents straightforward cyclic inserts and updates. Concurrent transactions modifying different edges can still create race conditions unless graph updates are serialized or coordinated with appropriate locking or transaction isolation. A production implementation must address that concurrency case explicitly.
+
+The recursive `dependency_closure` query calculates indirect prerequisites. This is important because a release candidate can be blocked by a transitive dependency even when its direct prerequisite appears complete or is incorrectly modeled.
+
+### Progress and release planning
+
+The `epic_progress` view aggregates feature counts and estimates for each epic. `weighted_completion_percent` measures completed estimated effort against total estimated effort. `NULLIF` prevents division by zero, while `COALESCE` ensures empty aggregates return usable numeric values.
+
+The `feature_readiness` view reports whether dependencies are satisfied for active features. It separates prerequisite readiness from acceptance verification and release capacity.
+
+The release-planning query filters unfinished R1 features, excludes candidates with incomplete prerequisite chains, and uses a window function to calculate cumulative estimated effort in priority order. The `fits_capacity` column indicates which ranked candidates fit within the release's point budget.
+
+This query is a planning report rather than a complete scheduling optimizer. A feature that does not fit the cumulative budget might still fit a different allocation. Release commitments should also account for team availability, delivery risk, business value, and dependencies.
+
+### Triggers, audit history, and transactions
+
+The status-history triggers insert lifecycle records whenever an epic or feature is created or changes status. The audit rows preserve the previous state, new state, item identifier, and timestamp.
+
+The epic completion trigger rejects completion while any child feature remains active. Together, the completion triggers and history table provide database-level enforcement and traceability.
+
+The script uses a transaction to create the schema objects, insert sample data, evaluate the model, demonstrate rejection of a cyclic dependency, and commit the valid changes. The deliberately invalid dependency is caught inside a PL/pgSQL exception block and rolled back to a savepoint.
+
+The trigger-based history table records state transitions, not every possible change to a title, estimate, owner, priority, or description. Full change-data auditing would require additional triggers or a separate audit mechanism. The history table also references work items by type and numeric identifier rather than using a single foreign key, so its integrity depends on controlled write paths and appropriate audit-retention practices.
+
+Execute the SQL script in a PostgreSQL environment. It creates objects in the dedicated `product_planning` schema.
+
+## Dependency management and release feasibility
+
+A dependency answers whether a capability requires another capability. Priority answers which work is more important. Capacity answers how much estimated work a release can accommodate. These are separate planning dimensions.
+
+A critical feature may be blocked by a prerequisite. A low-priority feature may still be required for a release's compliance obligations. A feature can be technically ready but excluded because the release lacks capacity. A feature can fit the budget but remain inappropriate for delivery if its acceptance conditions have not been met.
+
+Effective release planning evaluates these constraints independently and explains the reason for every exclusion. The planning examples use deterministic heuristics to make those decisions visible. Complex portfolios may require dependency-aware scheduling, multiple delivery teams, skill constraints, risk-adjusted estimates, and explicit business-value scoring.
+
+## Data integrity and operational limitations
+
+The implementations demonstrate domain validation, lifecycle control, dependency-cycle detection, progress reporting, release-capacity checks, and audit events. Their persistence and concurrency guarantees differ.
+
+- The Python and JavaScript programs maintain in-memory state. Their audit records disappear when the process ends unless exported or connected to durable storage.
+- The C++ program uses in-memory standard containers and exception-based validation. It does not provide multi-user transactions or persistent recovery.
+- The Java program separates domain types, workflow policies, and service operations, but its registries and audit trail are also in memory.
+- The PostgreSQL model persists relationships and enforces selected cross-record rules through constraints and triggers. Its cycle validation and audit design still require careful transaction and permission management in production.
+
+Estimates should be treated as planning measurements rather than objective measures of developer productivity. A feature's completion should be based on explicit acceptance evidence, not a status update alone. Epics should be evaluated against their business outcomes even when all planned features are complete, because delivering capabilities and realizing the intended business benefit are related but distinct events.
